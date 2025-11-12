@@ -1,21 +1,26 @@
 import os
 import io
 import textwrap
-from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 import feedparser
-from readability import Document
 
-# Переменные окружения
-TG_TOKEN = os.getenv("TG_TOKEN")                # секрет из GitHub Secrets
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")            # например, @real_pisces или -100XXXXXXXXXX
+# Опциональный импорт readability (на случай сбоев в зависимостях)
+try:
+    from readability import Document
+    HAVE_READABILITY = True
+except Exception:
+    Document = None
+    HAVE_READABILITY = False
+
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")            # @real_pisces или -100XXXXXXXXXX
 ZODIAC_NAME = os.getenv("ZODIAC_NAME", "Рыбы")
 SOURCE_TYPE = os.getenv("SOURCE_TYPE", "RSS")   # "HTML" или "RSS"
-SOURCE_URL = os.getenv("SOURCE_URL")            # страница или RSS
-CSS_SELECTOR = os.getenv("CSS_SELECTOR", "")    # для HTML-режима (опционально)
-ATTRIBUTION = os.getenv("ATTRIBUTION", "")      # подпись-источник (URL)
+SOURCE_URL = os.getenv("SOURCE_URL")
+CSS_SELECTOR = os.getenv("CSS_SELECTOR", "")
+ATTRIBUTION = os.getenv("ATTRIBUTION", "")
 POST_TITLE = os.getenv("POST_TITLE", "Самый точный гороскоп: {zodiac}").format(zodiac=ZODIAC_NAME)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -40,21 +45,21 @@ def fetch_text_html(url, selector=None):
     if selector:
         soup = BeautifulSoup(html, "lxml")
         node = soup.select_one(selector)
-        if not node:
+        if node:
+            return node.get_text("\n", strip=True)
+    if HAVE_READABILITY:
+        try:
             doc = Document(html)
             summary_html = doc.summary()
             return html_to_text(summary_html)
-        return node.get_text("\n", strip=True)
-    else:
-        doc = Document(html)
-        summary_html = doc.summary()
-        return html_to_text(summary_html)
+        except Exception:
+            pass
+    return html_to_text(html)
 
 def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
     feed = feedparser.parse(url)
     if not feed.entries:
         return fetch_text_html(url, fallback_selector)[:limit_chars]
-
     entry = feed.entries[0]
     text = ""
     if entry.get("content"):
@@ -64,9 +69,7 @@ def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
             text = ""
     if not text:
         text = entry.get("summary", "") or entry.get("description", "") or ""
-
     text = html_to_text(text)
-
     link = entry.get("link")
     if link and len(text) < 300:
         try:
@@ -75,7 +78,6 @@ def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
                 text = text_full
         except Exception:
             pass
-
     return text[:limit_chars]
 
 def pick_keyphrase(text, max_len=140):
@@ -85,15 +87,42 @@ def pick_keyphrase(text, max_len=140):
             return text[:idx+1]
     return text[:max_len]
 
+# ---- Новые помощники измерения текста для Pillow 10+ ----
+def measure_text(draw, text, font):
+    """
+    Возвращает (width, height) для одной строки текста.
+    Использует textbbox (Pillow 10+), с fallback на textsize для старых версий.
+    """
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        return right - left, bottom - top
+    except AttributeError:
+        # Pillow < 10
+        return draw.textsize(text, font=font)
+
+def measure_multiline_text(draw, text, font, spacing=6, align="left"):
+    """
+    Возвращает (width, height) для многострочного текста.
+    Использует multiline_textbbox (Pillow 10+), с fallback на multiline_textsize.
+    """
+    try:
+        left, top, right, bottom = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=align)
+        return right - left, bottom - top
+    except AttributeError:
+        # Pillow < 10
+        return draw.multiline_textsize(text, font=font, spacing=spacing)
+
 def generate_image(zodiac, keyphrase):
     W, H = 1024, 1024
     img = Image.new("RGB", (W, H), color=(15, 14, 35))
     draw = ImageDraw.Draw(img)
 
+    # Градиентный фон
     for y in range(H):
         c = int(35 + 60 * y / H)
         draw.line([(0, y), (W, y)], fill=(c, 20, 80))
 
+    # Шрифты
     try:
         title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 72)
         body_font = ImageFont.truetype("DejaVuSans.ttf", 42)
@@ -103,18 +132,20 @@ def generate_image(zodiac, keyphrase):
         body_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
 
-    # Заголовок для ежедневного поста
+    # Заголовок
     title = f"{zodiac} — Гороскоп дня"
-    tw, th = draw.textsize(title, font=title_font)
+    tw, th = measure_text(draw, title, title_font)
     draw.text(((W - tw)//2, 80), title, fill=(240, 230, 255), font=title_font)
 
+    # Ключевая фраза
     wrapped = textwrap.fill(keyphrase, width=26)
-    bw, bh = draw.multiline_textsize(wrapped, font=body_font, spacing=6)
+    bw, bh = measure_multiline_text(draw, wrapped, body_font, spacing=6, align="center")
     draw.multiline_text(((W - bw)//2, (H - bh)//2), wrapped,
                         fill=(245, 245, 250), font=body_font, spacing=6, align="center")
 
+    # Подпись
     footer = "by @real_pisces"
-    fw, fh = draw.textsize(footer, font=small_font)
+    fw, fh = measure_text(draw, footer, small_font)
     draw.text((W - fw - 30, H - fh - 30), footer, fill=(220, 210, 235), font=small_font)
 
     bio = io.BytesIO()
