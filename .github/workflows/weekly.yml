@@ -2,7 +2,7 @@ name: Weekly Horoscope Post
 
 on:
   schedule:
-    # Каждый понедельник 07:00 UTC (проверьте часовой пояс)
+    # Каждый понедельник 07:00 UTC
     - cron: "0 7 * * 1"
   workflow_dispatch: {}
 
@@ -11,21 +11,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install system fonts (optional)
+
+      - name: Install system fonts (for Pillow)
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-dejavu-core
-      - run: pip install -r requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
       - name: Run bot
-        run: python main.py
         env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ZODIAC_NAME: "Овен"
-          SOURCE_TYPE: "HTML"   # или "RSS"
-          SOURCE_URL: "https://horo.mail.ru/prediction/aries/week/"
-          CSS_SELECTOR: "div.article__text"   # замените под актуальный селектор
-          ATTRIBUTION: "https://horo.mail.ru/prediction/aries/week/"
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}                    # добавьте в Settings → Secrets → Actions
+          TG_CHAT_ID: "@real_pisces"                           # ваш канал (для приватного — -100XXXXXXXXXX)
+          ZODIAC_NAME: "Рыбы"
+          SOURCE_TYPE: "RSS"
+          SOURCE_URL: "https://astroscope.ru/horoskop/nedelniy_goroskop/pisces.html"
+          CSS_SELECTOR: ""                                     # не используем (RSS + авто-fallback)
+          ATTRIBUTION: "https://astroscope.ru/horoskop/nedelniy_goroskop/pisces.html"
+          POST_TITLE: "Самый точный гороскоп: {zodiac}"
+        run: python main.py
