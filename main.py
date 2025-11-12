@@ -26,12 +26,10 @@ def http_get(url, timeout=30):
     return r
 
 def html_to_text(html):
-    # Очистка HTML в простой текст
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.extract()
     text = soup.get_text("\n", strip=True)
-    # Сжать лишние пустые строки
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
     return "\n".join(lines)
@@ -43,27 +41,22 @@ def fetch_text_html(url, selector=None):
         soup = BeautifulSoup(html, "lxml")
         node = soup.select_one(selector)
         if not node:
-            # fallback на readability
             doc = Document(html)
             summary_html = doc.summary()
             return html_to_text(summary_html)
         return node.get_text("\n", strip=True)
     else:
-        # Автоматическое извлечение через readability
         doc = Document(html)
         summary_html = doc.summary()
         return html_to_text(summary_html)
 
 def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
     feed = feedparser.parse(url)
-    # Если это не RSS (или пусто), пробуем трактовать URL как HTML-страницу
     if not feed.entries:
         return fetch_text_html(url, fallback_selector)[:limit_chars]
 
     entry = feed.entries[0]
-    # Текст из RSS
     text = ""
-    # content (если есть) предпочтительнее
     if entry.get("content"):
         try:
             text = entry["content"][0].get("value", "")
@@ -74,7 +67,6 @@ def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
 
     text = html_to_text(text)
 
-    # Если коротко — подтянуть полную версию со страницы по ссылке записи
     link = entry.get("link")
     if link and len(text) < 300:
         try:
@@ -87,7 +79,6 @@ def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
     return text[:limit_chars]
 
 def pick_keyphrase(text, max_len=140):
-    # Берем первое предложение адекватной длины
     for sep in [". ", "… ", "\n", "! ", "? "]:
         idx = text.find(sep)
         if 40 < idx < max_len:
@@ -95,17 +86,14 @@ def pick_keyphrase(text, max_len=140):
     return text[:max_len]
 
 def generate_image(zodiac, keyphrase):
-    # Простая генерация: градиент + заголовок + ключевая фраза
     W, H = 1024, 1024
     img = Image.new("RGB", (W, H), color=(15, 14, 35))
     draw = ImageDraw.Draw(img)
 
-    # Горизонтальный градиент
     for y in range(H):
         c = int(35 + 60 * y / H)
         draw.line([(0, y), (W, y)], fill=(c, 20, 80))
 
-    # Подгрузка шрифтов (в Workflow ставим fonts-dejavu)
     try:
         title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 72)
         body_font = ImageFont.truetype("DejaVuSans.ttf", 42)
@@ -115,18 +103,16 @@ def generate_image(zodiac, keyphrase):
         body_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
 
-    # Заголовок
-    title = f"{zodiac} — Гороскоп недели"
+    # Заголовок для ежедневного поста
+    title = f"{zodiac} — Гороскоп дня"
     tw, th = draw.textsize(title, font=title_font)
     draw.text(((W - tw)//2, 80), title, fill=(240, 230, 255), font=title_font)
 
-    # Ключевая фраза
     wrapped = textwrap.fill(keyphrase, width=26)
     bw, bh = draw.multiline_textsize(wrapped, font=body_font, spacing=6)
     draw.multiline_text(((W - bw)//2, (H - bh)//2), wrapped,
                         fill=(245, 245, 250), font=body_font, spacing=6, align="center")
 
-    # Подпись
     footer = "by @real_pisces"
     fw, fh = draw.textsize(footer, font=small_font)
     draw.text((W - fw - 30, H - fh - 30), footer, fill=(220, 210, 235), font=small_font)
@@ -139,7 +125,6 @@ def generate_image(zodiac, keyphrase):
 def tg_send_photo(token, chat_id, photo_bytes, caption):
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
-    # Не указываем parse_mode, чтобы избежать проблем с HTML-разметкой из источников
     data = {"chat_id": chat_id, "caption": caption[:1024], "disable_notification": True}
     r = requests.post(url, data=data, files=files, timeout=60)
     r.raise_for_status()
@@ -160,7 +145,6 @@ def main():
     if not SOURCE_URL:
         raise RuntimeError("SOURCE_URL не задан.")
 
-    # Получаем текст
     if SOURCE_TYPE.upper() == "RSS":
         text = fetch_text_rss(SOURCE_URL, fallback_selector=CSS_SELECTOR or None)
     else:
@@ -176,10 +160,8 @@ def main():
 
     keyphrase = pick_keyphrase(body)
 
-    # Генерация изображения
     img_bytes = generate_image(ZODIAC_NAME, keyphrase)
 
-    # Публикация: если влезает в caption — отправляем как подпись к фото
     if len(full_text) <= 1000:
         tg_send_photo(TG_TOKEN, TG_CHAT_ID, img_bytes, full_text)
     else:
