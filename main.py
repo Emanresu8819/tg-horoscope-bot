@@ -6,103 +6,168 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 import feedparser
+from readability import Document
 
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # @username канала или -100ID для приватного
-ZODIAC_NAME = os.getenv("ZODIAC_NAME", "Овен")
-SOURCE_TYPE = os.getenv("SOURCE_TYPE", "HTML")  # "HTML" или "RSS"
-SOURCE_URL = os.getenv("SOURCE_URL")  # страница или RSS
-CSS_SELECTOR = os.getenv("CSS_SELECTOR", "")   # CSS-селектор основного текста для HTML
-ATTRIBUTION = os.getenv("ATTRIBUTION", "")     # ссылка/подпись источника
-POST_TITLE = os.getenv("POST_TITLE", "Еженедельный гороскоп: {zodiac}").format(zodiac=ZODIAC_NAME)
+# Переменные окружения
+TG_TOKEN = os.getenv("TG_TOKEN")                # секрет из GitHub Secrets
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")            # например, @real_pisces или -100XXXXXXXXXX
+ZODIAC_NAME = os.getenv("ZODIAC_NAME", "Рыбы")
+SOURCE_TYPE = os.getenv("SOURCE_TYPE", "RSS")   # "HTML" или "RSS"
+SOURCE_URL = os.getenv("SOURCE_URL")            # страница или RSS
+CSS_SELECTOR = os.getenv("CSS_SELECTOR", "")    # для HTML-режима (опционально)
+ATTRIBUTION = os.getenv("ATTRIBUTION", "")      # подпись-источник (URL)
+POST_TITLE = os.getenv("POST_TITLE", "Самый точный гороскоп: {zodiac}").format(zodiac=ZODIAC_NAME)
 
-def fetch_text_html(url, selector):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=30)
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+def http_get(url, timeout=30):
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    node = soup.select_one(selector)
-    if not node:
-        raise RuntimeError("Не найден блок по CSS_SELECTOR")
-    text = node.get_text("\n", strip=True)
-    return text
+    return r
 
-def fetch_text_rss(url, limit_chars=2000):
+def html_to_text(html):
+    # Очистка HTML в простой текст
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.extract()
+    text = soup.get_text("\n", strip=True)
+    # Сжать лишние пустые строки
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+def fetch_text_html(url, selector=None):
+    resp = http_get(url)
+    html = resp.text
+    if selector:
+        soup = BeautifulSoup(html, "lxml")
+        node = soup.select_one(selector)
+        if not node:
+            # fallback на readability
+            doc = Document(html)
+            summary_html = doc.summary()
+            return html_to_text(summary_html)
+        return node.get_text("\n", strip=True)
+    else:
+        # Автоматическое извлечение через readability
+        doc = Document(html)
+        summary_html = doc.summary()
+        return html_to_text(summary_html)
+
+def fetch_text_rss(url, fallback_selector=None, limit_chars=3000):
     feed = feedparser.parse(url)
+    # Если это не RSS (или пусто), пробуем трактовать URL как HTML-страницу
     if not feed.entries:
-        raise RuntimeError("RSS пуст")
+        return fetch_text_html(url, fallback_selector)[:limit_chars]
+
     entry = feed.entries[0]
-    text = entry.get("summary", "") or entry.get("description", "") or entry.get("title", "")
-    text = BeautifulSoup(text, "lxml").get_text("\n", strip=True)
+    # Текст из RSS
+    text = ""
+    # content (если есть) предпочтительнее
+    if entry.get("content"):
+        try:
+            text = entry["content"][0].get("value", "")
+        except Exception:
+            text = ""
+    if not text:
+        text = entry.get("summary", "") or entry.get("description", "") or ""
+
+    text = html_to_text(text)
+
+    # Если коротко — подтянуть полную версию со страницы по ссылке записи
+    link = entry.get("link")
+    if link and len(text) < 300:
+        try:
+            text_full = fetch_text_html(link, fallback_selector)
+            if len(text_full) > len(text):
+                text = text_full
+        except Exception:
+            pass
+
     return text[:limit_chars]
 
-def pick_keyphrase(text, max_len=120):
-    for sep in [". ", "\n", "!", "?"]:
+def pick_keyphrase(text, max_len=140):
+    # Берем первое предложение адекватной длины
+    for sep in [". ", "… ", "\n", "! ", "? "]:
         idx = text.find(sep)
         if 40 < idx < max_len:
             return text[:idx+1]
     return text[:max_len]
 
 def generate_image(zodiac, keyphrase):
+    # Простая генерация: градиент + заголовок + ключевая фраза
     W, H = 1024, 1024
     img = Image.new("RGB", (W, H), color=(15, 14, 35))
     draw = ImageDraw.Draw(img)
 
-    # простой градиент
+    # Горизонтальный градиент
     for y in range(H):
         c = int(35 + 60 * y / H)
         draw.line([(0, y), (W, y)], fill=(c, 20, 80))
 
-    # шрифты
+    # Подгрузка шрифтов (в Workflow ставим fonts-dejavu)
     try:
         title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 72)
         body_font = ImageFont.truetype("DejaVuSans.ttf", 42)
-    except:
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 28)
+    except Exception:
         title_font = ImageFont.load_default()
         body_font = ImageFont.load_default()
+        small_font = ImageFont.load_default()
 
+    # Заголовок
     title = f"{zodiac} — Гороскоп недели"
     tw, th = draw.textsize(title, font=title_font)
-    draw.text(((W - tw)//2, 90), title, fill=(240, 230, 255), font=title_font)
+    draw.text(((W - tw)//2, 80), title, fill=(240, 230, 255), font=title_font)
 
+    # Ключевая фраза
     wrapped = textwrap.fill(keyphrase, width=26)
     bw, bh = draw.multiline_textsize(wrapped, font=body_font, spacing=6)
-    draw.multiline_text(((W - bw)//2, (H - bh)//2), wrapped, fill=(245, 245, 250), font=body_font, spacing=6, align="center")
+    draw.multiline_text(((W - bw)//2, (H - bh)//2), wrapped,
+                        fill=(245, 245, 250), font=body_font, spacing=6, align="center")
 
-    footer = "by @your_bot"
-    fw, fh = draw.textsize(footer, font=body_font)
-    draw.text((W - fw - 30, H - fh - 30), footer, fill=(220, 210, 235), font=body_font)
+    # Подпись
+    footer = "by @real_pisces"
+    fw, fh = draw.textsize(footer, font=small_font)
+    draw.text((W - fw - 30, H - fh - 30), footer, fill=(220, 210, 235), font=small_font)
 
     bio = io.BytesIO()
     img.save(bio, format="JPEG", quality=90)
     bio.seek(0)
     return bio
 
-def send_photo_with_caption(token, chat_id, photo_bytes, caption):
+def tg_send_photo(token, chat_id, photo_bytes, caption):
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
-    data = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML", "disable_notification": True}
+    # Не указываем parse_mode, чтобы избежать проблем с HTML-разметкой из источников
+    data = {"chat_id": chat_id, "caption": caption[:1024], "disable_notification": True}
     r = requests.post(url, data=data, files=files, timeout=60)
     r.raise_for_status()
     return r.json()
 
-def send_message(token, chat_id, text):
+def tg_send_message(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True, "disable_notification": True}
+    data = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True, "disable_notification": True}
     r = requests.post(url, data=data, timeout=60)
     r.raise_for_status()
     return r.json()
 
 def main():
-    if not TG_TOKEN or not TG_CHAT_ID or not SOURCE_URL:
-        raise RuntimeError("Не заданы TG_TOKEN, TG_CHAT_ID, SOURCE_URL")
+    if not TG_TOKEN:
+        raise RuntimeError("TG_TOKEN не задан (добавьте в GitHub Secrets).")
+    if not TG_CHAT_ID:
+        raise RuntimeError("TG_CHAT_ID не задан (например, @real_pisces).")
+    if not SOURCE_URL:
+        raise RuntimeError("SOURCE_URL не задан.")
 
+    # Получаем текст
     if SOURCE_TYPE.upper() == "RSS":
-        text = fetch_text_rss(SOURCE_URL)
+        text = fetch_text_rss(SOURCE_URL, fallback_selector=CSS_SELECTOR or None)
     else:
-        if not CSS_SELECTOR:
-            raise RuntimeError("Для HTML источника нужен CSS_SELECTOR")
-        text = fetch_text_html(SOURCE_URL, CSS_SELECTOR)
+        text = fetch_text_html(SOURCE_URL, selector=CSS_SELECTOR or None)
+
+    if not text or len(text) < 30:
+        raise RuntimeError("Не удалось извлечь содержимое гороскопа или оно слишком короткое.")
 
     header = POST_TITLE
     body = text
@@ -110,14 +175,17 @@ def main():
     full_text = f"{header}\n\n{body}{footer}"
 
     keyphrase = pick_keyphrase(body)
+
+    # Генерация изображения
     img_bytes = generate_image(ZODIAC_NAME, keyphrase)
 
+    # Публикация: если влезает в caption — отправляем как подпись к фото
     if len(full_text) <= 1000:
-        send_photo_with_caption(TG_TOKEN, TG_CHAT_ID, img_bytes, full_text)
+        tg_send_photo(TG_TOKEN, TG_CHAT_ID, img_bytes, full_text)
     else:
         short_caption = f"{header}\n\n{keyphrase}"
-        send_photo_with_caption(TG_TOKEN, TG_CHAT_ID, img_bytes, short_caption)
-        send_message(TG_TOKEN, TG_CHAT_ID, full_text)
+        tg_send_photo(TG_TOKEN, TG_CHAT_ID, img_bytes, short_caption)
+        tg_send_message(TG_TOKEN, TG_CHAT_ID, full_text)
 
 if __name__ == "__main__":
     main()
